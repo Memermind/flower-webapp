@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Выбор адреса доставки</title>
+
+  <!-- Telegram WebApp API -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <!-- MapLibre GL JS -->
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+    #map { flex: 1; }
+
+    .panel {
+      padding: 12px;
+      background: rgba(255,255,255,0.97);
+      border-top: 1px solid #eaeaea;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      font-size: 16px;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      cursor: pointer;
+      background: #f3f4f6;
+      color: #111;
+    }
+
+    .btn-primary { background: #2ea6ff; color: #fff; }
+
+    .hint { font-size: 13px; color: #555; margin-top: 6px; }
+    .addr { font-size: 14px; margin-top: 6px; color: #111; }
+    .badge { font-size: 12px; background:#eef6ff; padding:4px 8px; border-radius:999px; }
+
+    .results {
+      margin-top: 8px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      max-height: 160px;
+      overflow-y: auto;
+    }
+
+    .result {
+      padding: 10px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .result:last-child { border-bottom: none; }
+    .result:hover { background: #f8fafc; }
+
+    .warn {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #a14;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div id="map"></div>
+
+    <div class="panel">
+      <div class="row">
+        <span class="badge" id="coordsBadge">Точка не выбрана</span>
+        <button class="btn" id="btnMyLoc">📍 Моё местоположение</button>
+        <button class="btn btn-primary" id="btnConfirm" disabled>✅ Подтвердить</button>
+      </div>
+
+      <div class="col">
+        <input id="addrInput" placeholder="Введите адрес (город, улица, дом)..." />
+        <div class="row">
+          <input id="aptInput" placeholder="Квартира (необязательно)" style="max-width: 220px;" />
+          <button class="btn btn-primary" id="btnSearch">🔎 Найти</button>
+          <button class="btn" id="btnClear">✖ Сброс</button>
+        </div>
+      </div>
+
+      <div class="results" id="results" style="display:none;"></div>
+
+      <div class="addr" id="addrText"></div>
+      <div class="hint">
+        Можно: 1) нажать на карту, 2) найти адрес по строке, 3) взять “моё местоположение”.
+        После выбора нажмите “Подтвердить” (или используйте кнопку Telegram снизу).
+      </div>
+
+      <div class="warn" id="warn"></div>
+    </div>
+  </div>
+
+  <script>
+    const tg = window.Telegram?.WebApp;
+    const warn = document.getElementById('warn');
+
+    function showWarn(text) {
+      warn.textContent = text || "";
+    }
+
+    // Telegram WebApp init
+    if (tg) {
+      tg.expand();
+      tg.ready();
+
+      // Надёжная “системная” кнопка Telegram
+      tg.MainButton.setText("✅ Подтвердить адрес");
+      tg.MainButton.hide(); // покажем только когда выбрана точка
+    } else {
+      showWarn("WebApp открыт не внутри Telegram. Откройте карту через кнопку в боте.");
+    }
+
+    // --- Map style using raster tiles (OSM)
+    const style = {
+      "version": 8,
+      "sources": {
+        "raster-tiles": {
+          "type": "raster",
+          "tiles": [
+            "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          ],
+          "tileSize": 256,
+          "attribution": "© OpenStreetMap contributors"
+        }
+      },
+      "layers": [
+        {
+          "id": "osm",
+          "type": "raster",
+          "source": "raster-tiles"
+        }
+      ]
+    };
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style,
+      center: [4.8952, 52.3702], // lon, lat
+      zoom: 12
+    });
+
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+
+    let marker = null;
+    let picked = null; // {lat, lon, address}
+
+    const coordsBadge = document.getElementById('coordsBadge');
+    const addrText = document.getElementById('addrText');
+    const btnConfirm = document.getElementById('btnConfirm');
+    const btnMyLoc = document.getElementById('btnMyLoc');
+    const btnSearch = document.getElementById('btnSearch');
+    const btnClear = document.getElementById('btnClear');
+
+    const addrInput = document.getElementById('addrInput');
+    const aptInput = document.getElementById('aptInput');
+    const resultsBox = document.getElementById('results');
+
+    function setPicked(lat, lon, address = "") {
+      picked = { lat, lon, address };
+
+      if (!marker) {
+        marker = new maplibregl.Marker({ draggable: true })
+          .setLngLat([lon, lat])
+          .addTo(map);
+
+        marker.on('dragend', async () => {
+          const p = marker.getLngLat();
+          await reverseGeocode(p.lat, p.lng);
+          updateUI();
+          enableConfirm();
+        });
+      } else {
+        marker.setLngLat([lon, lat]);
+      }
+
+      updateUI();
+      enableConfirm();
+    }
+
+    function updateUI() {
+      if (!picked) {
+        coordsBadge.textContent = "Точка не выбрана";
+        addrText.textContent = "";
+        btnConfirm.disabled = true;
+        if (tg) tg.MainButton.hide();
+        return;
+      }
+
+      coordsBadge.textContent = `Координаты: ${picked.lat.toFixed(6)}, ${picked.lon.toFixed(6)}`;
+      const apt = (aptInput.value || "").trim();
+      const aptPart = apt ? `, кв. ${apt}` : "";
+
+      if (picked.address) {
+        addrText.textContent = `Адрес: ${picked.address}${aptPart}`;
+      } else {
+        addrText.textContent = `Адрес: (не определён)${aptPart}`;
+      }
+    }
+
+    function enableConfirm() {
+      btnConfirm.disabled = !picked;
+      if (tg && picked) {
+        tg.MainButton.show();
+      }
+    }
+
+    // Click on map to set marker
+    map.on("click", async (e) => {
+      const lon = e.lngLat.lng;
+      const lat = e.lngLat.lat;
+      setPicked(lat, lon, "");
+      await reverseGeocode(lat, lon);
+      updateUI();
+    });
+
+    // Reverse geocode (Nominatim)
+    async function reverseGeocode(lat, lon) {
+      try {
+        // NOTE: публичный Nominatim имеет лимиты; для больших нагрузок лучше свой/платный геокодер
+        const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
+        const res = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (!res.ok) throw new Error("reverse failed");
+        const data = await res.json();
+        if (picked) picked.address = data.display_name || "";
+      } catch (e) {
+        if (picked) picked.address = "";
+      }
+    }
+
+    // Search address -> list results -> select -> marker
+    async function searchAddress(query) {
+      const q = (query || "").trim();
+      if (!q) return [];
+
+      try {
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}&limit=6`;
+        const res = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (!res.ok) throw new Error("search failed");
+        return await res.json();
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function renderResults(items) {
+      if (!items || items.length === 0) {
+        resultsBox.style.display = "none";
+        resultsBox.innerHTML = "";
+        return;
+      }
+
+      resultsBox.style.display = "block";
+      resultsBox.innerHTML = "";
+
+      items.forEach(it => {
+        const div = document.createElement("div");
+        div.className = "result";
+        div.textContent = it.display_name || `${it.lat}, ${it.lon}`;
+        div.onclick = async () => {
+          resultsBox.style.display = "none";
+          addrInput.value = it.display_name || addrInput.value;
+
+          const lat = parseFloat(it.lat);
+          const lon = parseFloat(it.lon);
+
+          map.flyTo({ center: [lon, lat], zoom: 16 });
+          setPicked(lat, lon, it.display_name || "");
+          updateUI();
+        };
+        resultsBox.appendChild(div);
+      });
+    }
+
+    btnSearch.addEventListener("click", async () => {
+      const items = await searchAddress(addrInput.value);
+      renderResults(items);
+    });
+
+    addrInput.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const items = await searchAddress(addrInput.value);
+        renderResults(items);
+      }
+    });
+
+    aptInput.addEventListener("input", () => updateUI());
+
+    btnClear.addEventListener("click", () => {
+      picked = null;
+      if (marker) { marker.remove(); marker = null; }
+      addrInput.value = "";
+      aptInput.value = "";
+      resultsBox.style.display = "none";
+      resultsBox.innerHTML = "";
+      updateUI();
+      showWarn("");
+    });
+
+    // Get current location (browser geo)
+    btnMyLoc.addEventListener("click", () => {
+      if (!navigator.geolocation) {
+        alert("Геолокация недоступна на этом устройстве.");
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
+        map.flyTo({ center: [lon, lat], zoom: 16 });
+        setPicked(lat, lon, "");
+        await reverseGeocode(lat, lon);
+        updateUI();
+      }, () => {
+        alert("Не удалось получить геопозицию. Проверьте разрешения.");
+      }, { enableHighAccuracy: true, timeout: 8000 });
+    });
+
+    // Build payload and send to bot
+    function sendToBot() {
+      if (!picked) return;
+
+      const apt = (aptInput.value || "").trim();
+      const aptPart = apt ? `, кв. ${apt}` : "";
+
+      const address = (picked.address || addrInput.value || "").trim() + aptPart;
+
+      const payload = {
+        lat: picked.lat,
+        lon: picked.lon,
+        address: address,
+        apartment: apt,
+        map_link: `https://maps.google.com/?q=${picked.lat},${picked.lon}`
+      };
+
+      if (tg) {
+        tg.sendData(JSON.stringify(payload));
+        tg.close();
+      } else {
+        // если вдруг открыли не из Telegram
+        alert("WebApp должен быть открыт из Telegram. Данные:\n" + JSON.stringify(payload, null, 2));
+      }
+    }
+
+    btnConfirm.addEventListener("click", sendToBot);
+
+    if (tg) {
+      tg.MainButton.onClick(sendToBot);
+    }
+  </script>
+</body>
+</html>
