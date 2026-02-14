@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Выбор адреса доставки</title>
+
+  <!-- Telegram WebApp API -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <!-- Yandex Maps JS API 2.1 -->
+  <script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&apikey=d45b21dd-8e96-412f-8105-bb73a0d706af"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+
+    #map { flex: 1; }
+
+    .panel {
+      padding: 12px;
+      background: rgba(255,255,255,0.97);
+      border-top: 1px solid #eaeaea;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      font-size: 16px;
+      outline: none;
+    }
+    input:focus { border-color: #2ea6ff; }
+
+    .btn {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      cursor: pointer;
+      background: #f3f4f6;
+      color: #111;
+    }
+
+    .btn-primary { background: #2ea6ff; color: #fff; }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .hint { font-size: 13px; color: #555; margin-top: 6px; line-height: 1.35; }
+    .addr { font-size: 14px; margin-top: 6px; color: #111; }
+    .badge { font-size: 12px; background:#eef6ff; padding:4px 8px; border-radius:999px; }
+
+    .warn { margin-top: 8px; font-size: 13px; color: #a14; }
+    .ok { margin-top: 8px; font-size: 13px; color: #0a7; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div id="map"></div>
+
+    <div class="panel">
+      <div class="row">
+        <span class="badge" id="statusBadge">Введите адрес и выберите из подсказок (СПб/ЛО)</span>
+        <button class="btn" id="btnMyLoc">📍 Моё местоположение</button>
+        <button class="btn btn-primary" id="btnConfirm" disabled>✅ Подтвердить адрес</button>
+      </div>
+
+      <div class="col">
+        <input id="addrInput" placeholder="Начните вводить: улица, дом, корпус/строение..." autocomplete="off" />
+        <div class="row">
+          <input id="aptInput" placeholder="Квартира (обязательно)" style="max-width: 240px;" inputmode="numeric" />
+          <button class="btn" id="btnClear">✖ Сброс</button>
+        </div>
+      </div>
+
+      <div class="addr" id="addrText"></div>
+      <div class="warn" id="warn"></div>
+      <div class="ok" id="ok"></div>
+
+      <div class="hint">
+        Подтвердить можно только после выбора адреса из подсказок Яндекса (существующий дом) и ввода квартиры.
+        Поиск ограничен Санкт-Петербургом и Ленинградской областью.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const tg = window.Telegram?.WebApp;
+
+    const statusBadge = document.getElementById('statusBadge');
+    const addrText = document.getElementById('addrText');
+    const warn = document.getElementById('warn');
+    const ok = document.getElementById('ok');
+
+    const btnMyLoc = document.getElementById('btnMyLoc');
+    const btnConfirm = document.getElementById('btnConfirm');
+    const btnClear = document.getElementById('btnClear');
+
+    const addrInput = document.getElementById('addrInput');
+    const aptInput = document.getElementById('aptInput');
+
+    function showWarn(text) { warn.textContent = text || ""; }
+    function showOk(text) { ok.textContent = text || ""; }
+
+    if (tg) {
+      tg.expand();
+      tg.ready();
+      tg.MainButton.setText("✅ Подтвердить адрес");
+      tg.MainButton.hide();
+    }
+
+    // ---- Ограничение: СПб + Ленинградская область (примерные границы)
+    // boundedBy: [[latSW, lonSW], [latNE, lonNE]]  (ВАЖНО: в Яндексе порядок [lat, lon])
+    const BOUNDS_SPB_LO = [
+      [58.3, 28.7],  // SW
+      [61.3, 35.7]   // NE
+    ];
+
+    // ---- State
+    let map, placemark, suggestView;
+
+    // Выбранный и ПРОВЕРЕННЫЙ геокодером адрес "house"
+    // { lat, lon, addressShort, addressFull, map_link }
+    let selectedPlace = null;
+
+    function normalizeApartment(value) {
+      const v = (value || "").trim();
+      if (!v) return "";
+      if (!/\d/.test(v)) return "";
+      return v;
+    }
+
+    function isWithinBounds(lat, lon) {
+      const sw = BOUNDS_SPB_LO[0];
+      const ne = BOUNDS_SPB_LO[1];
+      return lat >= sw[0] && lat <= ne[0] && lon >= sw[1] && lon <= ne[1];
+    }
+
+    function formatShortAddress(geoObject) {
+      // Из компонентов адреса соберём "улица, дом, корпус/строение"
+      // У Яндекса часто house уже содержит "10к2" и т.п., поэтому отдельный корпус может не понадобиться.
+      const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+      const comps = (md && md.Address && md.Address.Components) ? md.Address.Components : [];
+
+      function find(kindList) {
+        for (const k of kindList) {
+          const c = comps.find(x => x.kind === k);
+          if (c && c.name) return c.name;
+        }
+        return "";
+      }
+
+      const street = find(["street", "route"]);
+      const house  = find(["house"]);
+      // Иногда корпус/строение бывает отдельным компонентом, но часто в "house"
+      const building = find(["building"]);
+
+      let parts = [];
+      if (street) parts.push(street);
+      if (house) parts.push(house);
+      // Добавим building только если он выглядит как корпус/строение и не дублирует house
+      if (building && building !== house) parts.push(building);
+
+      return parts.join(", ").trim();
+    }
+
+    function updateUI() {
+      const apt = normalizeApartment(aptInput.value);
+      const hasSelection = !!selectedPlace;
+
+      if (!hasSelection) {
+        statusBadge.textContent = "Введите адрес и выберите из подсказок (СПб/ЛО)";
+        addrText.textContent = "";
+        btnConfirm.disabled = true;
+        showOk("");
+        if (tg) tg.MainButton.hide();
+        return;
+      }
+
+      statusBadge.textContent = "Адрес выбран ✅ (введите квартиру)";
+      addrText.textContent = "Адрес: " + selectedPlace.addressShort;
+
+      const canConfirm = !!apt;
+      btnConfirm.disabled = !canConfirm;
+
+      if (tg) {
+        if (canConfirm) tg.MainButton.show();
+        else tg.MainButton.hide();
+      }
+
+      if (canConfirm) showOk("Можно подтвердить адрес ✅");
+      else showOk("");
+    }
+
+    function resetSelection(message) {
+      selectedPlace = null;
+      showOk("");
+      if (message) showWarn(message);
+      updateUI();
+    }
+
+    function setPlacemark(lat, lon) {
+      if (!placemark) {
+        placemark = new ymaps.Placemark([lat, lon], {}, { draggable: false });
+        map.geoObjects.add(placemark);
+      } else {
+        placemark.geometry.setCoordinates([lat, lon]);
+      }
+    }
+
+    async function geocodeHouse(addressText) {
+      // Геокодим строго дом (house), строго в пределах bounds
+      try {
+        const res = await ymaps.geocode(addressText, {
+          results: 5,
+          boundedBy: BOUNDS_SPB_LO,
+          strictBounds: true,
+          kind: 'house'
+        });
+
+        const geoObject = res.geoObjects.get(0);
+        if (!geoObject) return null;
+
+        const coords = geoObject.geometry.getCoordinates(); // [lat, lon]
+        const lat = coords[0];
+        const lon = coords[1];
+
+        if (!isWithinBounds(lat, lon)) return null;
+
+        // Убедимся, что это действительно "домовой" результат
+        const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+        const precision = md && md.precision ? md.precision : "";
+        // precision может быть: exact, number, near, street, other...
+        // Для домового адреса чаще всего exact/number
+        if (precision && !(precision === "exact" || precision === "number")) {
+          return null;
+        }
+
+        const shortAddr = formatShortAddress(geoObject);
+        // Если не смогли собрать "улица+дом" — считаем невалидным
+        if (!shortAddr || shortAddr.split(",").length < 2) return null;
+
+        const fullAddr = geoObject.getAddressLine();
+
+        return { lat, lon, addressShort: shortAddr, addressFull: fullAddr };
+      } catch {
+        return null;
+      }
+    }
+
+    function sendToBot() {
+      const apt = normalizeApartment(aptInput.value);
+
+      if (!selectedPlace) {
+        showWarn("Сначала выберите адрес из подсказок (существующий дом) в СПб/ЛО.");
+        updateUI();
+        return;
+      }
+      if (!apt) {
+        showWarn("Введите номер квартиры (обязательно).");
+        updateUI();
+        return;
+      }
+
+      const payload = {
+        lat: selectedPlace.lat,
+        lon: selectedPlace.lon,
+        address: `${selectedPlace.addressShort}, кв. ${apt}`,
+        apartment: apt,
+        map_link: selectedPlace.map_link
+      };
+
+      if (tg) {
+        tg.sendData(JSON.stringify(payload));
+        tg.close();
+      } else {
+        alert(JSON.stringify(payload, null, 2));
+      }
+    }
+
+    // Init Yandex map & suggest
+    ymaps.ready(async () => {
+      map = new ymaps.Map("map", {
+        center: [59.9386, 30.3141], // [lat, lon]
+        zoom: 11,
+        controls: ['zoomControl']
+      });
+
+      // Ограничим перемещение карты рамками СПб/ЛО (чтобы UX был “правильный”)
+      map.setBounds(BOUNDS_SPB_LO, { checkZoomRange: true });
+
+      // SuggestView (подсказки) с первого символа
+      // Важно: ограничиваем подсказки рамкой, и жестко рамкой (strict)
+      suggestView = new ymaps.SuggestView('addrInput', {
+        results: 8,
+        boundedBy: BOUNDS_SPB_LO,
+        strictBounds: true
+      });
+
+      // Если пользователь печатает после выбора — сбрасываем выбор
+      addrInput.addEventListener('input', () => {
+        if (selectedPlace && addrInput.value.trim() !== (selectedPlace.addressShort || "").trim()) {
+          resetSelection("");
+        }
+
+        const q = (addrInput.value || "").trim();
+        if (q.length > 0 && q.length < 3) {
+          // Не "адрес не найден" — а мягкая подсказка
+          showWarn("Введите ещё несколько символов и выберите адрес из подсказок (только существующие дома в СПб/ЛО).");
+        } else {
+          showWarn("");
+        }
+      });
+
+      aptInput.addEventListener('input', () => updateUI());
+
+      // Когда пользователь выбрал подсказку
+      suggestView.events.add('select', async (e) => {
+        const item = e.get('item');
+        const value = item && item.value ? item.value : '';
+        if (!value) {
+          resetSelection("Не удалось прочитать выбранный адрес. Попробуйте снова.");
+          return;
+        }
+
+        showWarn("Проверяем адрес…");
+
+        // Принцип: можно подтвердить только после того, как геокодер вернул домовой адрес
+        const geo = await geocodeHouse(value);
+
+        if (!geo) {
+          // Сбрасываем выбор, запрещаем подтверждение
+          selectedPlace = null;
+          showWarn("Адрес не найден как существующий дом в СПб/ЛО. Выберите другой адрес из подсказок.");
+          updateUI();
+          return;
+        }
+
+        // ВАЖНО: в поле ввода ставим короткий адрес (улица, дом, корпус/строение)
+        addrInput.value = geo.addressShort;
+
+        selectedPlace = {
+          lat: geo.lat,
+          lon: geo.lon,
+          addressShort: geo.addressShort,
+          addressFull: geo.addressFull,
+          map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`
+        };
+
+        // Ставим метку
+        setPlacemark(geo.lat, geo.lon);
+        map.setCenter([geo.lat, geo.lon], 16, { duration: 250 });
+
+        showWarn("");
+        updateUI();
+      });
+
+      // Кнопка "Моё местоположение" — можно оставить, но подтверждение всё равно только через выбор подсказки
+      btnMyLoc.addEventListener('click', () => {
+        if (!navigator.geolocation) {
+          alert("Геолокация недоступна.");
+          return;
+        }
+        navigator.geolocation.getCurrentPosition((pos) => {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+
+          if (!isWithinBounds(lat, lon)) {
+            resetSelection("Местоположение вне СПб/ЛО. Введите адрес и выберите из подсказок.");
+            map.setCenter([59.9386, 30.3141], 11);
+            return;
+          }
+
+          // Центруем карту и показываем метку, но НЕ подтверждаем адрес
+          setPlacemark(lat, lon);
+          map.setCenter([lat, lon], 16);
+
+          selectedPlace = null;
+          showWarn("Чтобы подтвердить — введите адрес и выберите его из подсказок (существующий дом в СПб/ЛО).");
+          updateUI();
+        }, () => {
+          alert("Не удалось получить геопозицию. Проверьте разрешения.");
+        }, { enableHighAccuracy: true, timeout: 8000 });
+      });
+
+      btnClear.addEventListener('click', () => {
+        selectedPlace = null;
+        addrInput.value = "";
+        aptInput.value = "";
+        if (placemark) {
+          map.geoObjects.remove(placemark);
+          placemark = null;
+        }
+        map.setCenter([59.9386, 30.3141], 11);
+        showWarn("");
+        showOk("");
+        updateUI();
+      });
+
+      btnConfirm.addEventListener('click', sendToBot);
+      if (tg) tg.MainButton.onClick(sendToBot);
+
+      updateUI();
+    });
+  </script>
+</body>
+</html>
