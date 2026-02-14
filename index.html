@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Выбор адреса доставки</title>
+
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <!-- Yandex Maps JS API 2.1 -->
+  <script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&apikey=d45b21dd-8e96-412f-8105-bb73a0d706af"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+    #map { flex: 1; }
+
+    .panel {
+      padding: 12px;
+      background: rgba(255,255,255,0.97);
+      border-top: 1px solid #eaeaea;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; position: relative; }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      font-size: 16px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    input:focus { border-color: #2ea6ff; }
+
+    .btn {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      cursor: pointer;
+      background: #f3f4f6;
+      color: #111;
+    }
+
+    .btn-primary { background: #2ea6ff; color: #fff; }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .hint { font-size: 13px; color: #555; margin-top: 6px; line-height: 1.35; }
+    .addr { font-size: 14px; margin-top: 6px; color: #111; }
+    .badge { font-size: 12px; background:#eef6ff; padding:4px 8px; border-radius:999px; }
+
+    .warn { margin-top: 8px; font-size: 13px; color: #a14; }
+    .ok { margin-top: 8px; font-size: 13px; color: #0a7; }
+
+    /* Подсказки */
+    .results {
+      position: absolute;
+      top: 46px;
+      left: 0;
+      right: 0;
+      background: #fff;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      max-height: 220px;
+      overflow-y: auto;
+      display: none;
+      z-index: 9999;
+    }
+    .result {
+      padding: 10px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1.25;
+    }
+    .result:last-child { border-bottom: none; }
+    .result:hover { background: #f8fafc; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div id="map"></div>
+
+    <div class="panel">
+      <div class="row">
+        <span class="badge" id="statusBadge">Введите адрес и выберите из подсказок (СПб/ЛО)</span>
+        <button class="btn" id="btnMyLoc">📍 Моё местоположение</button>
+        <button class="btn btn-primary" id="btnConfirm" disabled>✅ Подтвердить адрес</button>
+      </div>
+
+      <div class="col">
+        <input id="addrInput" placeholder="Улица, дом, корпус/строение..." autocomplete="off" />
+        <div class="results" id="results"></div>
+
+        <div class="row" style="margin-top:6px;">
+          <input id="aptInput" placeholder="Квартира (обязательно)" style="max-width: 240px;" inputmode="numeric" />
+          <button class="btn" id="btnClear">✖ Сброс</button>
+        </div>
+      </div>
+
+      <div class="addr" id="addrText"></div>
+      <div class="warn" id="warn"></div>
+      <div class="ok" id="ok"></div>
+
+      <div class="hint">
+        Можно поставить метку кликом по карте, но подтвердить получится только если Яндекс определит существующий дом (house) в СПб/ЛО
+        и вы введёте квартиру.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const tg = window.Telegram?.WebApp;
+
+    const statusBadge = document.getElementById('statusBadge');
+    const addrText = document.getElementById('addrText');
+    const warn = document.getElementById('warn');
+    const ok = document.getElementById('ok');
+
+    const btnMyLoc = document.getElementById('btnMyLoc');
+    const btnConfirm = document.getElementById('btnConfirm');
+    const btnClear = document.getElementById('btnClear');
+
+    const addrInput = document.getElementById('addrInput');
+    const aptInput = document.getElementById('aptInput');
+
+    const resultsBox = document.getElementById('results');
+
+    function showWarn(text) { warn.textContent = text || ""; }
+    function showOk(text) { ok.textContent = text || ""; }
+
+    if (tg) {
+      tg.expand();
+      tg.ready();
+      tg.MainButton.setText("✅ Подтвердить адрес");
+      tg.MainButton.hide();
+    }
+
+    // Ограничение: СПб + Ленинградская область (примерные границы)
+    // В Яндекс: boundedBy = [[latSW, lonSW], [latNE, lonNE]]
+    const BOUNDS_SPB_LO = [
+      [58.3, 28.7],
+      [61.3, 35.7]
+    ];
+
+    function isWithinBounds(lat, lon) {
+      const sw = BOUNDS_SPB_LO[0];
+      const ne = BOUNDS_SPB_LO[1];
+      return lat >= sw[0] && lat <= ne[0] && lon >= sw[1] && lon <= ne[1];
+    }
+
+    function normalizeApartment(value) {
+      const v = (value || "").trim();
+      if (!v) return "";
+      if (!/\d/.test(v)) return "";
+      return v;
+    }
+
+    // selectedPlace — только подтверждённый "house"
+    let selectedPlace = null; // { lat, lon, addressShort, addressFull, map_link }
+
+    let map, placemark;
+
+    function setPlacemark(lat, lon) {
+      if (!placemark) {
+        placemark = new ymaps.Placemark([lat, lon], {}, { draggable: false });
+        map.geoObjects.add(placemark);
+      } else {
+        placemark.geometry.setCoordinates([lat, lon]);
+      }
+    }
+
+    function clearResults() {
+      resultsBox.style.display = "none";
+      resultsBox.innerHTML = "";
+    }
+
+    function formatShortAddress(geoObject) {
+      const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+      const comps = (md && md.Address && md.Address.Components) ? md.Address.Components : [];
+
+      function find(kindList) {
+        for (const k of kindList) {
+          const c = comps.find(x => x.kind === k);
+          if (c && c.name) return c.name;
+        }
+        return "";
+      }
+
+      const street = find(["street", "route"]);
+      const house  = find(["house"]);
+      const building = find(["building"]);
+
+      let parts = [];
+      if (street) parts.push(street);
+      if (house) parts.push(house);
+      if (building && building !== house) parts.push(building);
+
+      return parts.join(", ").trim();
+    }
+
+    async function geocodeHouse(text) {
+      try {
+        const res = await ymaps.geocode(text, {
+          results: 5,
+          boundedBy: BOUNDS_SPB_LO,
+          strictBounds: true,
+          kind: 'house'
+        });
+
+        const geoObject = res.geoObjects.get(0);
+        if (!geoObject) return null;
+
+        const coords = geoObject.geometry.getCoordinates(); // [lat, lon]
+        const lat = coords[0];
+        const lon = coords[1];
+
+        if (!isWithinBounds(lat, lon)) return null;
+
+        const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+        const precision = md && md.precision ? md.precision : "";
+        if (precision && !(precision === "exact" || precision === "number")) {
+          return null;
+        }
+
+        const shortAddr = formatShortAddress(geoObject);
+        if (!shortAddr || shortAddr.split(",").length < 2) return null;
+
+        const fullAddr = geoObject.getAddressLine();
+
+        return { lat, lon, addressShort: shortAddr, addressFull: fullAddr };
+      } catch {
+        return null;
+      }
+    }
+
+    function updateUI() {
+      const apt = normalizeApartment(aptInput.value);
+      const hasSelection = !!selectedPlace;
+
+      if (!hasSelection) {
+        statusBadge.textContent = "Введите адрес и выберите из подсказок (СПб/ЛО)";
+        addrText.textContent = "";
+        btnConfirm.disabled = true;
+        showOk("");
+        if (tg) tg.MainButton.hide();
+        return;
+      }
+
+      statusBadge.textContent = "Адрес выбран ✅ (введите квартиру)";
+      addrText.textContent = "Адрес: " + selectedPlace.addressShort;
+
+      const canConfirm = !!apt;
+      btnConfirm.disabled = !canConfirm;
+
+      if (tg) {
+        if (canConfirm) tg.MainButton.show();
+        else tg.MainButton.hide();
+      }
+
+      if (canConfirm) showOk("Можно подтвердить адрес ✅");
+      else showOk("");
+    }
+
+    function resetSelection(msg) {
+      selectedPlace = null;
+      showOk("");
+      if (msg) showWarn(msg);
+      updateUI();
+    }
+
+    function renderResults(items) {
+      if (!items || items.length === 0) {
+        clearResults();
+        return;
+      }
+
+      resultsBox.style.display = "block";
+      resultsBox.innerHTML = "";
+
+      items.slice(0, 8).forEach((it) => {
+        const div = document.createElement("div");
+        div.className = "result";
+        div.textContent = it.displayName;
+
+        div.onclick = async () => {
+          clearResults();
+          showWarn("Проверяем адрес…");
+
+          // ВАЖНО: подтверждаем только через геокодер house
+          const geo = await geocodeHouse(it.fullText);
+          if (!geo) {
+            resetSelection("Адрес не найден как существующий дом в СПб/ЛО. Выберите другой адрес из подсказок.");
+            return;
+          }
+
+          // В поле ввода ставим короткий адрес
+          addrInput.value = geo.addressShort;
+
+          selectedPlace = {
+            lat: geo.lat,
+            lon: geo.lon,
+            addressShort: geo.addressShort,
+            addressFull: geo.addressFull,
+            map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`
+          };
+
+          setPlacemark(geo.lat, geo.lon);
+          map.setCenter([geo.lat, geo.lon], 16, { duration: 250 });
+
+          showWarn("");
+          updateUI();
+        };
+
+        resultsBox.appendChild(div);
+      });
+    }
+
+    // Подсказки через ymaps.suggest (стабильнее, чем SuggestView в WebView)
+    let debounceTimer = null;
+    let lastQuery = "";
+
+    async function getSuggestions(q) {
+      const query = (q || "").trim();
+      if (!query) return [];
+
+      // Подсказываем с 1 символа, но сообщение "уточните" покажем на <3
+      try {
+        const suggestRes = await ymaps.suggest(query, {
+          results: 8,
+          boundedBy: BOUNDS_SPB_LO,
+          strictBounds: true
+        });
+
+        // suggestRes: массив строк или объектов (в разных режимах)
+        // Нормализуем в {displayName, fullText}
+        const out = [];
+        for (const s of (suggestRes || [])) {
+          if (typeof s === "string") {
+            out.push({ displayName: s, fullText: s });
+          } else if (s && typeof s === "object") {
+            const val = s.value || s.displayName || "";
+            if (val) out.push({ displayName: val, fullText: val });
+          }
+        }
+        return out;
+      } catch {
+        return [];
+      }
+    }
+
+    addrInput.addEventListener("input", () => {
+      const q = addrInput.value || "";
+
+      // если пользователь меняет строку после выбора — сброс
+      if (selectedPlace && q.trim() !== (selectedPlace.addressShort || "").trim()) {
+        selectedPlace = null;
+      }
+
+      updateUI();
+
+      const query = q.trim();
+      if (!query) {
+        clearResults();
+        showWarn("");
+        return;
+      }
+
+      if (query.length < 3) {
+        // не говорим "не найден", просим дописать
+        showWarn("Введите ещё несколько символов и выберите адрес из подсказок (существующий дом в СПб/ЛО).");
+      } else {
+        showWarn("");
+      }
+
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(async () => {
+        const now = (addrInput.value || "").trim();
+        lastQuery = now;
+
+        const items = await getSuggestions(now);
+        if (lastQuery !== now) return;
+
+        renderResults(items);
+
+        if ((items || []).length === 0 && now.length >= 3) {
+          resetSelection("Подсказок нет. Уточните адрес (улица и номер дома) и выберите из подсказок.");
+        }
+      }, 200);
+    });
+
+    addrInput.addEventListener("focus", () => {
+      if (resultsBox.innerHTML.trim()) resultsBox.style.display = "block";
+    });
+
+    document.addEventListener("click", (e) => {
+      const isInside = resultsBox.contains(e.target) || addrInput.contains(e.target);
+      if (!isInside) clearResults();
+    });
+
+    aptInput.addEventListener("input", () => updateUI());
+
+    // Клик по карте: ставим метку, но подтверждение будет ТОЛЬКО после house-геокодинга
+    // Поэтому после клика мы делаем обратный геокодинг и, если это дом, разрешаем.
+    async function reverseGeocodeHouse(lat, lon) {
+      try {
+        const res = await ymaps.geocode([lat, lon], { results: 5, kind: 'house' });
+        const geoObject = res.geoObjects.get(0);
+        if (!geoObject) return null;
+
+        const coords = geoObject.geometry.getCoordinates();
+        const rLat = coords[0], rLon = coords[1];
+
+        if (!isWithinBounds(rLat, rLon)) return null;
+
+        const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+        const precision = md && md.precision ? md.precision : "";
+        if (precision && !(precision === "exact" || precision === "number")) {
+          return null;
+        }
+
+        const shortAddr = formatShortAddress(geoObject);
+        if (!shortAddr || shortAddr.split(",").length < 2) return null;
+
+        const fullAddr = geoObject.getAddressLine();
+        return { lat: rLat, lon: rLon, addressShort: shortAddr, addressFull: fullAddr };
+      } catch {
+        return null;
+      }
+    }
+
+    function sendToBot() {
+      const apt = normalizeApartment(aptInput.value);
+
+      if (!selectedPlace) {
+        showWarn("Сначала выберите адрес из подсказок или кликните по дому на карте (существующий house в СПб/ЛО).");
+        updateUI();
+        return;
+      }
+      if (!apt) {
+        showWarn("Введите номер квартиры (обязательно).");
+        updateUI();
+        return;
+      }
+
+      const payload = {
+        lat: selectedPlace.lat,
+        lon: selectedPlace.lon,
+        address: `${selectedPlace.addressShort}, кв. ${apt}`,
+        apartment: apt,
+        map_link: `https://yandex.ru/maps/?pt=${selectedPlace.lon},${selectedPlace.lat}&z=16&l=map`
+      };
+
+      if (tg) {
+        tg.sendData(JSON.stringify(payload));
+        tg.close();
+      } else {
+        alert(JSON.stringify(payload, null, 2));
+      }
+    }
+
+    ymaps.ready(() => {
+      map = new ymaps.Map("map", {
+        center: [59.9386, 30.3141],
+        zoom: 11,
+        controls: ['zoomControl']
+      });
+
+      map.setBounds(BOUNDS_SPB_LO, { checkZoomRange: true });
+
+      map.events.add('click', async (e) => {
+        const coords = e.get('coords'); // [lat, lon]
+        const lat = coords[0], lon = coords[1];
+
+        setPlacemark(lat, lon);
+        showWarn("Проверяем выбранную точку…");
+
+        const geo = await reverseGeocodeHouse(lat, lon);
+        if (!geo) {
+          resetSelection("По этой точке не найден существующий дом (house) в СПб/ЛО. Выберите дом точнее или используйте подсказки.");
+          return;
+        }
+
+        addrInput.value = geo.addressShort;
+        selectedPlace = {
+          lat: geo.lat,
+          lon: geo.lon,
+          addressShort: geo.addressShort,
+          addressFull: geo.addressFull,
+          map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`
+        };
+
+        showWarn("");
+        updateUI();
+      });
+
+      btnMyLoc.addEventListener('click', () => {
+        if (!navigator.geolocation) {
+          alert("Геолокация недоступна.");
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+
+          setPlacemark(lat, lon);
+          map.setCenter([lat, lon], 16);
+
+          showWarn("Проверяем текущую точку…");
+          const geo = await reverseGeocodeHouse(lat, lon);
+          if (!geo) {
+            resetSelection("По вашей точке не найден существующий дом (house) в СПб/ЛО. Введите адрес и выберите из подсказок.");
+            return;
+          }
+
+          addrInput.value = geo.addressShort;
+          selectedPlace = {
+            lat: geo.lat,
+            lon: geo.lon,
+            addressShort: geo.addressShort,
+            addressFull: geo.addressFull,
+            map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`
+          };
+
+          showWarn("");
+          updateUI();
+        }, () => alert("Не удалось получить геопозицию."), { enableHighAccuracy: true, timeout: 8000 });
+      });
+
+      btnClear.addEventListener('click', () => {
+        selectedPlace = null;
+        addrInput.value = "";
+        aptInput.value = "";
+        clearResults();
+        if (placemark) {
+          map.geoObjects.remove(placemark);
+          placemark = null;
+        }
+        map.setCenter([59.9386, 30.3141], 11);
+        showWarn("");
+        showOk("");
+        updateUI();
+      });
+
+      btnConfirm.addEventListener('click', sendToBot);
+      if (tg) tg.MainButton.onClick(sendToBot);
+
+      updateUI();
+    });
+  </script>
+</body>
+</html>
