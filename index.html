@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Выбор адреса доставки</title>
+
+  <!-- Telegram WebApp API -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <!-- Yandex Maps JS API 2.1 -->
+  <script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&apikey=d45b21dd-8e96-412f-8105-bb73a0d706af"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    .wrap { height: 100%; display: flex; flex-direction: column; }
+    #map { flex: 1; }
+
+    .panel {
+      padding: 12px;
+      background: rgba(255,255,255,0.97);
+      border-top: 1px solid #eaeaea;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; position: relative; }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      font-size: 16px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    input:focus { border-color: #2ea6ff; }
+
+    .btn {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      cursor: pointer;
+      background: #f3f4f6;
+      color: #111;
+    }
+
+    .btn-primary { background: #2ea6ff; color: #fff; }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .hint { font-size: 13px; color: #555; margin-top: 6px; line-height: 1.35; }
+    .addr { font-size: 14px; margin-top: 6px; color: #111; }
+    .badge { font-size: 12px; background:#eef6ff; padding:4px 8px; border-radius:999px; }
+    .stage {
+      font-size: 12px;
+      background:#f4f4f5;
+      padding:4px 8px;
+      border-radius:999px;
+    }
+
+    .warn { margin-top: 8px; font-size: 13px; color: #a14; }
+    .ok { margin-top: 8px; font-size: 13px; color: #0a7; }
+
+    .results {
+      position: absolute;
+      top: 46px;
+      left: 0;
+      right: 0;
+      background: #fff;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+      max-height: 260px;
+      overflow-y: auto;
+      display: none;
+      z-index: 9999;
+    }
+    .result {
+      padding: 10px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1.25;
+    }
+    .result:last-child { border-bottom: none; }
+    .result:hover { background: #f8fafc; }
+    .muted { color:#666; font-size: 12px; margin-top: 3px; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div id="map"></div>
+
+    <div class="panel">
+      <div class="row">
+        <span class="badge" id="statusBadge">Введите улицу и выберите из подсказок (СПб/ЛО)</span>
+        <span class="stage" id="stageChip">Шаг: улица</span>
+        <button class="btn" id="btnMyLoc">📍 Моё местоположение</button>
+        <button class="btn btn-primary" id="btnConfirm" disabled>✅ Подтвердить адрес</button>
+      </div>
+
+      <div class="col">
+        <input id="addrInput" placeholder="Начните вводить улицу..." autocomplete="off" />
+        <div class="results" id="results"></div>
+
+        <div class="row" style="margin-top:6px;">
+          <input id="aptInput" placeholder="Квартира (обязательно)" style="max-width: 240px;" inputmode="text" />
+          <button class="btn" id="btnClear">✖ Сброс</button>
+        </div>
+      </div>
+
+      <div class="addr" id="addrText"></div>
+      <div class="warn" id="warn"></div>
+      <div class="ok" id="ok"></div>
+
+      <div class="hint">
+        Вводите адрес как в Яндекс.Картах: выберите улицу из подсказок — она подставится в строку, дальше допишите дом.
+        Если введёте сразу улицу + дом (появятся цифры), подсказки домов начнут грузиться автоматически.
+        Подтвердить можно только после выбора существующего дома + ввода квартиры. Поиск ограничен СПб и Ленинградской областью.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /***********************
+     * НАСТРОЙКИ
+     ***********************/
+    // ✅ ВСТАВЬ СЮДА СВОЙ DaData API-ключ (НЕ секретный ключ)
+    const DADATA_TOKEN = "13f8a74e3a5f41332160cb95285e03866c18f152";
+    const MIN_SUGGEST_LEN = 1;
+
+    // Примерные границы СПб+ЛО (для карты / проверки)
+    const BOUNDS_SPB_LO = [
+      [58.3, 28.7],
+      [61.3, 35.7]
+    ];
+
+    /***********************
+     * UI
+     ***********************/
+    const tg = window.Telegram?.WebApp;
+
+    const statusBadge = document.getElementById('statusBadge');
+    const stageChip = document.getElementById('stageChip');
+    const addrText = document.getElementById('addrText');
+    const warn = document.getElementById('warn');
+    const ok = document.getElementById('ok');
+
+    const btnMyLoc = document.getElementById('btnMyLoc');
+    const btnConfirm = document.getElementById('btnConfirm');
+    const btnClear = document.getElementById('btnClear');
+
+    const addrInput = document.getElementById('addrInput');
+    const aptInput = document.getElementById('aptInput');
+
+    const resultsBox = document.getElementById('results');
+
+    function showWarn(text) { warn.textContent = text || ""; }
+    function showOk(text) { ok.textContent = text || ""; }
+
+    if (tg) {
+      tg.expand();
+      tg.ready();
+      tg.MainButton.setText("✅ Подтвердить адрес");
+      tg.MainButton.hide();
+    }
+
+    function normalizeApartment(value) {
+      const v = (value || "").trim();
+      if (!v) return "";
+      if (!/\d/.test(v)) return "";
+      return v;
+    }
+
+    function isWithinBounds(lat, lon) {
+      const sw = BOUNDS_SPB_LO[0];
+      const ne = BOUNDS_SPB_LO[1];
+      return lat >= sw[0] && lat <= ne[0] && lon >= sw[1] && lon <= ne[1];
+    }
+
+    function clearResults() {
+      resultsBox.style.display = "none";
+      resultsBox.innerHTML = "";
+    }
+
+    function setInputValueAndCursor(value) {
+      addrInput.value = value;
+      const len = addrInput.value.length;
+      addrInput.focus();
+      addrInput.setSelectionRange(len, len);
+    }
+
+    function looksLikeHasHouse(q) {
+      return /\d/.test(q || "");
+    }
+
+    function extractStreetPart(q) {
+      // всё до первой цифры
+      return (q || "")
+        .replace(/\d.*$/, "")
+        .replace(/[,\s]+$/, "")
+        .trim();
+    }
+
+    function hasComma(q) {
+      return (q || "").includes(",");
+    }
+
+    /***********************
+     * STATE
+     ***********************/
+    // stage: "street" | "house"
+    let stage = "street";
+
+    // выбранная улица из DaData
+    let selectedStreet = null; // { street_with_type, city, region }
+
+    // выбранный дом (подтвержденный)
+    let selectedPlace = null; // { lat, lon, addressShort, addressFull, map_link, source }
+
+    function setStage(newStage) {
+      stage = newStage;
+
+      if (stage === "street") {
+        stageChip.textContent = "Шаг: улица";
+        statusBadge.textContent = "Введите улицу и выберите из подсказок (СПб/ЛО)";
+        addrInput.placeholder = "Начните вводить улицу...";
+      } else {
+        stageChip.textContent = "Шаг: дом";
+        statusBadge.textContent = "Допишите дом и выберите из подсказок";
+        addrInput.placeholder = "Улица уже подставлена — допишите дом…";
+      }
+
+      clearResults();
+      updateUI();
+    }
+
+    function updateUI() {
+      const apt = normalizeApartment(aptInput.value);
+      const hasHouse = !!selectedPlace;
+
+      if (!hasHouse) {
+        addrText.textContent = selectedStreet && stage === "house"
+          ? ("Улица: " + (selectedStreet.street_with_type || ""))
+          : "";
+
+        btnConfirm.disabled = true;
+        showOk("");
+        if (tg) tg.MainButton.hide();
+        return;
+      }
+
+      addrText.textContent = "Адрес: " + selectedPlace.addressShort;
+
+      const canConfirm = !!apt;
+      btnConfirm.disabled = !canConfirm;
+
+      if (tg) {
+        if (canConfirm) tg.MainButton.show();
+        else tg.MainButton.hide();
+      }
+
+      if (canConfirm) showOk("Можно подтвердить адрес ✅");
+      else showOk("");
+    }
+
+    function resetAll(msg) {
+      selectedStreet = null;
+      selectedPlace = null;
+      setStage("street");
+      addrInput.value = "";
+      aptInput.value = "";
+      clearResults();
+
+      if (placemark) {
+        map.geoObjects.remove(placemark);
+        placemark = null;
+      }
+      map.setCenter([59.9386, 30.3141], 11);
+
+      showOk("");
+      showWarn(msg || "");
+      updateUI();
+    }
+
+    function resetHouse(msg) {
+      selectedPlace = null;
+      showOk("");
+      showWarn(msg || "");
+      updateUI();
+    }
+
+    /***********************
+     * DADATA HELPERS
+     ***********************/
+    function isSpbOrLo(d) {
+      const city = (d.city_with_type || "").toLowerCase();
+      const region = (d.region_with_type || "").toLowerCase();
+
+      const isSpb = city.includes("санкт-петербург") || city.includes("санкт петербург");
+      const isLo = region.includes("ленинградская") || region.includes("ленинградская область");
+
+      return isSpb || isLo;
+    }
+
+    function isStreetLevel(d) {
+      return !!(d.street_with_type || d.street);
+    }
+
+    function isHouseLevel(d) {
+      return !!(d.street_with_type) && !!d.house && !!d.geo_lat && !!d.geo_lon;
+    }
+
+    // Формат подсказки дома: "улица, дом, корпус/строение"
+    function shortHouseFromDaData(d) {
+      const street = (d.street_with_type || "").trim();
+      const house = (d.house || "").trim();
+
+      let extra = "";
+      if (d.block) extra = `к${d.block}`;
+      else if (d.building) extra = `стр${d.building}`;
+
+      if (street && house) return `${street}, ${house}${extra ? " " + extra : ""}`.trim();
+      return "";
+    }
+
+    /***********************
+     * DADATA SUGGEST
+     ***********************/
+    async function dadataSuggest(query) {
+      const q = (query || "").trim();
+      if (!q || q.length < MIN_SUGGEST_LEN) return [];
+
+      if (!DADATA_TOKEN || DADATA_TOKEN === "PASTE_DADATA_TOKEN_HERE") {
+        showWarn("Нужно вставить DaData токен в index.html (DADATA_TOKEN).");
+        return [];
+      }
+
+      const url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address";
+
+      let body;
+
+      if (stage === "street") {
+        // Этап улицы: много подсказок улиц
+        body = {
+          query: q,
+          count: 10,
+          locations: [
+            { city: "Санкт-Петербург" },
+            { region: "Ленинградская" }
+          ],
+          restrict_value: true,
+          from_bound: { value: "city" },
+          to_bound:   { value: "street" }
+        };
+      } else {
+        // Этап дома: ищем дома
+        // Если строка уже содержит "улица, дом..." — используем как есть
+        // Иначе, если улица выбрана — склеим
+        const streetQ = (selectedStreet?.street_with_type || "").trim();
+        const fullQuery = hasComma(q) ? q : (streetQ ? `${streetQ}, ${q}` : q);
+
+        body = {
+          query: fullQuery,
+          count: 10,
+          locations: [
+            { city: "Санкт-Петербург" },
+            { region: "Ленинградская" }
+          ],
+          restrict_value: true,
+          from_bound: { value: "street" },
+          to_bound:   { value: "house" }
+        };
+      }
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": "Token " + DADATA_TOKEN
+          },
+          body: JSON.stringify(body)
+        });
+
+        if (!res.ok) return [];
+        const json = await res.json();
+        return (json && json.suggestions) ? json.suggestions : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function renderSuggestions(suggestions) {
+      if (!suggestions || suggestions.length === 0) {
+        clearResults();
+        return;
+      }
+
+      resultsBox.style.display = "block";
+      resultsBox.innerHTML = "";
+
+      suggestions.slice(0, 10).forEach((sug) => {
+        const d = sug.data || {};
+
+        let title = "";
+        let subtitle = "";
+
+        if (stage === "street") {
+          title = (d.street_with_type || sug.value || "").trim();
+          subtitle = ((d.city_with_type || "") + (d.region_with_type ? ", " + d.region_with_type : "")).trim();
+        } else {
+          title = shortHouseFromDaData(d) || (sug.value || "").trim();
+          subtitle = (d.city_with_type || d.region_with_type || "").trim();
+        }
+
+        const div = document.createElement("div");
+        div.className = "result";
+        div.textContent = title;
+
+        if (subtitle) {
+          const meta = document.createElement("div");
+          meta.className = "muted";
+          meta.textContent = subtitle;
+          div.appendChild(meta);
+        }
+
+        div.onclick = () => {
+          clearResults();
+          showWarn("");
+
+          if (!isSpbOrLo(d)) {
+            showWarn("Можно выбрать адрес только в Санкт-Петербурге или Ленинградской области.");
+            return;
+          }
+
+          if (stage === "street") {
+            if (!isStreetLevel(d)) {
+              showWarn("Выберите улицу из подсказок.");
+              return;
+            }
+
+            selectedStreet = {
+              street_with_type: (d.street_with_type || sug.value || "").trim(),
+              city: (d.city_with_type || "").trim(),
+              region: (d.region_with_type || "").trim()
+            };
+
+            selectedPlace = null;
+            setStage("house");
+
+            // ✅ подставляем улицу в строку и даём дальше печатать дом
+            setInputValueAndCursor(`${selectedStreet.street_with_type}, `);
+
+            showWarn("Допишите номер дома и выберите дом из подсказок.");
+            updateUI();
+            return;
+          }
+
+          // stage === "house"
+          if (!isHouseLevel(d)) {
+            showWarn("Нужен существующий адрес уровня «улица + дом». Выберите дом из подсказок.");
+            return;
+          }
+
+          const lat = parseFloat(d.geo_lat);
+          const lon = parseFloat(d.geo_lon);
+
+          if (!isWithinBounds(lat, lon)) {
+            resetHouse("Адрес вне зоны доставки (СПб/ЛО).");
+            return;
+          }
+
+          const shortAddr = shortHouseFromDaData(d);
+          if (!shortAddr) {
+            resetHouse("Не удалось собрать формат «улица, дом». Выберите другой адрес.");
+            return;
+          }
+
+          // ✅ В поле ввода ставим выбранный дом (красиво и однозначно)
+          setInputValueAndCursor(shortAddr);
+
+          selectedPlace = {
+            lat, lon,
+            addressShort: shortAddr,
+            addressFull: sug.value || shortAddr,
+            map_link: `https://yandex.ru/maps/?pt=${lon},${lat}&z=16&l=map`,
+            source: "dadata"
+          };
+
+          setPlacemark(lat, lon);
+          map.setCenter([lat, lon], 16, { duration: 250 });
+
+          updateUI();
+        };
+
+        resultsBox.appendChild(div);
+      });
+    }
+
+    /***********************
+     * INPUT LOGIC (street/house auto)
+     ***********************/
+    let debounceTimer = null;
+    let lastQuery = "";
+
+    addrInput.addEventListener("input", () => {
+      const qRaw = (addrInput.value || "");
+      const q = qRaw.trim();
+
+      // Если поле пустое — возвращаемся на улицу
+      if (!q) {
+        clearResults();
+        showWarn("");
+        selectedStreet = null;
+        selectedPlace = null;
+        if (stage !== "street") setStage("street");
+        updateUI();
+        return;
+      }
+
+      // ✅ Авто-переход на дома, если в строке появились цифры
+      if (stage === "street" && looksLikeHasHouse(q)) {
+        const streetPart = extractStreetPart(q);
+        if (streetPart.length >= 2) {
+          selectedStreet = { street_with_type: streetPart, city: "", region: "" };
+        } else {
+          selectedStreet = null;
+        }
+        setStage("house");
+      }
+
+      // Сброс выбранного дома при любом изменении строки
+      selectedPlace = null;
+
+      // Если человек в режиме "дом" удалил всё до улицы и снова печатает — можем вернуться на улицу
+      if (stage === "house") {
+        // если нет запятой и нет выбранной улицы и цифр — скорее всего вернулись к вводу улицы
+        if (!hasComma(q) && !selectedStreet && !looksLikeHasHouse(q)) {
+          setStage("street");
+        }
+      } else {
+        // stage street — сброс выбранной улицы при изменении
+        selectedStreet = null;
+      }
+
+      updateUI();
+
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(async () => {
+        const now = (addrInput.value || "").trim();
+        lastQuery = now;
+
+        const suggestions = await dadataSuggest(now);
+        if (lastQuery !== now) return;
+
+        let filtered = suggestions || [];
+        filtered = filtered.filter(s => isSpbOrLo(s.data || {}));
+
+        if (stage === "street") {
+          filtered = filtered.filter(s => isStreetLevel(s.data || {}));
+        } else {
+          filtered = filtered.filter(s => isHouseLevel(s.data || {}));
+        }
+
+        renderSuggestions(filtered);
+
+        if ((filtered || []).length === 0 && now.length >= 2) {
+          if (stage === "street") {
+            showWarn("Подсказок улиц нет. Уточните название (СПб/ЛО).");
+          } else {
+            showWarn("Подсказок домов нет. Уточните номер дома и выберите дом из подсказок.");
+          }
+        } else {
+          // не затираем важные сообщения, но если было "нет подсказок", уберём
+          if (warn.textContent && warn.textContent.startsWith("Подсказок")) showWarn("");
+        }
+      }, 160);
+    });
+
+    addrInput.addEventListener("focus", () => {
+      if (resultsBox.innerHTML.trim()) resultsBox.style.display = "block";
+    });
+
+    document.addEventListener("click", (e) => {
+      const isInside = resultsBox.contains(e.target) || addrInput.contains(e.target);
+      if (!isInside) clearResults();
+    });
+
+    aptInput.addEventListener("input", () => updateUI());
+
+    /***********************
+     * YANDEX MAP
+     ***********************/
+    let map, placemark;
+
+    function setPlacemark(lat, lon) {
+      if (!placemark) {
+        placemark = new ymaps.Placemark([lat, lon], {}, { draggable: false });
+        map.geoObjects.add(placemark);
+      } else {
+        placemark.geometry.setCoordinates([lat, lon]);
+      }
+    }
+
+    async function reverseGeocodeHouse(lat, lon) {
+      try {
+        const res = await ymaps.geocode([lat, lon], { results: 5, kind: 'house' });
+        const geoObject = res.geoObjects.get(0);
+        if (!geoObject) return null;
+
+        const coords = geoObject.geometry.getCoordinates();
+        const rLat = coords[0], rLon = coords[1];
+        if (!isWithinBounds(rLat, rLon)) return null;
+
+        const md = geoObject.properties.get('metaDataProperty.GeocoderMetaData');
+        const precision = md && md.precision ? md.precision : "";
+        if (precision && !(precision === "exact" || precision === "number")) return null;
+
+        const fullAddr = geoObject.getAddressLine() || "";
+        return { lat: rLat, lon: rLon, addressShort: fullAddr, addressFull: fullAddr };
+      } catch {
+        return null;
+      }
+    }
+
+    /***********************
+     * SEND TO BOT
+     ***********************/
+    function sendToBot() {
+      const apt = normalizeApartment(aptInput.value);
+
+      if (!selectedPlace) {
+        showWarn("Сначала выберите существующий дом из подсказок (улица + дом).");
+        return;
+      }
+      if (!apt) {
+        showWarn("Введите номер квартиры (обязательно).");
+        return;
+      }
+
+      const payload = {
+        lat: selectedPlace.lat,
+        lon: selectedPlace.lon,
+        address: `${selectedPlace.addressShort}, кв. ${apt}`,
+        apartment: apt,
+        map_link: selectedPlace.map_link
+      };
+
+      if (tg) {
+        tg.sendData(JSON.stringify(payload));
+        tg.close();
+      } else {
+        alert(JSON.stringify(payload, null, 2));
+      }
+    }
+
+    btnConfirm.addEventListener("click", sendToBot);
+    if (tg) tg.MainButton.onClick(sendToBot);
+
+    /***********************
+     * INIT MAP
+     ***********************/
+    ymaps.ready(() => {
+      map = new ymaps.Map("map", {
+        center: [59.9386, 30.3141],
+        zoom: 11,
+        controls: ['zoomControl']
+      });
+
+      map.setBounds(BOUNDS_SPB_LO, { checkZoomRange: true });
+
+      // Клик по карте выбирает дом (альтернативный путь)
+      map.events.add('click', async (e) => {
+        const coords = e.get('coords');
+        const lat = coords[0], lon = coords[1];
+
+        setPlacemark(lat, lon);
+        showWarn("Проверяем выбранную точку…");
+
+        const geo = await reverseGeocodeHouse(lat, lon);
+        if (!geo) {
+          resetHouse("По этой точке не найден существующий дом (house) в СПб/ЛО. Кликните точнее по зданию.");
+          return;
+        }
+
+        selectedStreet = null;
+        setStage("house");
+
+        setInputValueAndCursor(geo.addressShort);
+
+        selectedPlace = {
+          lat: geo.lat,
+          lon: geo.lon,
+          addressShort: geo.addressShort,
+          addressFull: geo.addressFull,
+          map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`,
+          source: "yandex_reverse"
+        };
+
+        showWarn("");
+        updateUI();
+      });
+
+      btnMyLoc.addEventListener('click', () => {
+        if (!navigator.geolocation) {
+          alert("Геолокация недоступна.");
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+
+          setPlacemark(lat, lon);
+          map.setCenter([lat, lon], 16);
+
+          showWarn("Проверяем текущую точку…");
+
+          const geo = await reverseGeocodeHouse(lat, lon);
+          if (!geo) {
+            resetHouse("По вашей точке не найден существующий дом (house) в СПб/ЛО. Выберите адрес через подсказки.");
+            return;
+          }
+
+          selectedStreet = null;
+          setStage("house");
+
+          setInputValueAndCursor(geo.addressShort);
+
+          selectedPlace = {
+            lat: geo.lat,
+            lon: geo.lon,
+            addressShort: geo.addressShort,
+            addressFull: geo.addressFull,
+            map_link: `https://yandex.ru/maps/?pt=${geo.lon},${geo.lat}&z=16&l=map`,
+            source: "yandex_geoloc"
+          };
+
+          showWarn("");
+          updateUI();
+        }, () => alert("Не удалось получить геопозицию."), { enableHighAccuracy: true, timeout: 8000 });
+      });
+
+      btnClear.addEventListener("click", () => resetAll(""));
+
+      setStage("street");
+      updateUI();
+    });
+  </script>
+</body>
+</html>
